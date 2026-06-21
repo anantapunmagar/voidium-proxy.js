@@ -1,6 +1,6 @@
 # voidium-proxy
 
-A lightweight HTTP proxy that routes requests based on the host name, with per-target ports, safety warnings for suspicious pages, verbose structured logging, and an admin API for custom domains.
+A lightweight HTTP proxy that routes requests based on the host name, with per-target ports, custom `yourname.voidium.uk` subdomains, safety warnings for proxied pages, verbose structured logging, and a small admin API.
 
 ## How It Routes
 
@@ -16,9 +16,13 @@ If only one target exists, you can also use just a port:
 
 - `3005.voidium.uk` -> target `pyro`, port `3005`
 
+Custom subdomains are checked before encoded-port routing:
+
+- `demo.voidium.uk` -> configured/admin-created alias, for example target `pyro`, port `3000`
+
 ## Config
 
-Create `config.json` (or use `eg.config.json`). You can use `targets` (preferred) or `pyro` (legacy single target).
+Create `config.json` (or use `eg.config.json`). You can use `targets` (preferred) or `pyro`/`delta` (legacy single target).
 
 ### Multi-target (recommended)
 
@@ -26,10 +30,13 @@ Create `config.json` (or use `eg.config.json`). You can use `targets` (preferred
 {
   "domaincut": ".voidium.uk",
   "masterToken": "change-me",
-  "customDomainsDb": "./custom-domains.sqlite",
+  "customSubdomainsDb": "./custom-subdomains.json",
   "targets": {
     "pyro": { "letter": "p", "host": "192.168.1.100", "portStart": 3000, "portEnd": 3999 },
     "byto": { "host": "192.168.1.101", "portStart": 4000, "portEnd": 4999 }
+  },
+  "customSubdomains": {
+    "demo": { "target": "pyro", "port": 3000 }
   }
 }
 ```
@@ -40,51 +47,61 @@ Create `config.json` (or use `eg.config.json`). You can use `targets` (preferred
 {
   "domaincut": ".voidium.uk",
   "masterToken": "change-me",
-  "customDomainsDb": "./custom-domains.sqlite",
-  "pyro": { "letter": "p", "host": "192.168.1.100", "portStart": 3000, "portEnd": 3999 }
+  "customSubdomainsDb": "./custom-subdomains.json",
+  "pyro": { "letter": "p", "host": "192.168.1.100", "portStart": 3000, "portEnd": 3999 },
+  "customSubdomains": {
+    "demo": { "target": "pyro", "port": 3000 }
+  }
 }
 ```
 
-## Custom Domains API
+### Domain DNS
 
-You can create custom hostnames (like `name.c.voidium.uk`) that map to a specific target and port. These are stored in a SQLite database (`custom-domains.sqlite`).
+For public `name.voidium.uk` aliases, create a wildcard DNS record for `*.voidium.uk` pointing at the machine or load balancer running this proxy. The proxy itself only handles HTTP routing after the request reaches it.
 
-### Add a custom domain
+## Custom Subdomains API
+
+You can create custom subdomains like `yourdomainname.voidium.uk` that map to a specific target and port. Dynamic aliases are stored in `customSubdomainsDb` as JSON, while aliases in `customSubdomains` are managed by config and cannot be overwritten by the API.
+
+Set `masterToken` to enable the API. Requests must include:
 
 ```
-POST /__proxy-admin/domains
+Authorization: Bearer <masterToken>
+```
+
+### Add or update a subdomain
+
+```
+POST /__proxy-admin/subdomains
 Authorization: Bearer <masterToken>
 Content-Type: application/json
 
-{ "domain": "name.c.voidium.uk", "target": "pyro", "port": 3007 }
+{ "subdomain": "yourdomainname", "target": "pyro", "port": 3007 }
 ```
 
-### List all custom domains
+Then route traffic to:
 
 ```
-GET /__proxy-admin/domains
+http://yourdomainname.voidium.uk/
+```
+
+### List subdomains
+
+```
+GET /__proxy-admin/subdomains
 Authorization: Bearer <masterToken>
 ```
 
-### Remove a custom domain
+### Remove a dynamic subdomain
 
 ```
-DELETE /__proxy-admin/domains
+DELETE /__proxy-admin/subdomains/yourdomainname
 Authorization: Bearer <masterToken>
-Content-Type: application/json
-
-{ "domain": "name.c.voidium.uk" }
 ```
 
 ## Safety Warning
 
-If a request looks suspicious, the proxy serves a warning page once every 30 days per target. It only triggers for **HTML GET/HEAD** requests, so scripts, styles, and assets are not affected.
-
-Suspicion rules include:
-- URL path contains high-risk keywords (e.g. `login`, `verify`, `wallet`, `bank`)
-- Very long paths or query strings
-- Many digits in the host
-- Missing User-Agent header
+For browser HTML requests, the proxy serves a one-time notice page before forwarding traffic. It only triggers for **HTML GET/HEAD** responses, so scripts, styles, and assets are not affected.
 
 Users can continue via a one-click consent page. The consent is stored in a cookie for 30 days.
 
@@ -96,9 +113,16 @@ Structured logging is on by default. Control verbosity with `LOG_LEVEL`:
 LOG_LEVEL=debug
 ```
 
+## Improvements
+
+- Host parsing is normalized before routing, including mixed case, trailing dots, and port suffixes.
+- Proxied request bodies are not parsed by the admin API middleware.
+- Port ranges are validated consistently for HTTP, WebSocket, config-defined aliases, and dynamic aliases.
+- Legacy `pyro` and `delta` single-target configs are both supported.
+
 ## Timeouts
 
-Upstream fetches are aborted after `UPSTREAM_TIMEOUT_MS` (default 15000ms). Set it like:
+Upstream fetches are aborted after `UPSTREAM_TIMEOUT_MS` (default 30000ms). Set it like:
 
 ```
 UPSTREAM_TIMEOUT_MS=5000
@@ -120,4 +144,4 @@ PORT=8080 npm start
 ## Notes
 
 - This proxy does not terminate TLS. Run it behind a TLS terminator (like nginx or Caddy) if you need HTTPS.
-- The routing logic assumes the target port is embedded in the host name (unless using a custom domain mapping).
+- The routing logic assumes the target port is embedded in the host name unless using a custom subdomain mapping.

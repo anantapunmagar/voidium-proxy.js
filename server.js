@@ -2,9 +2,10 @@ const http = require('http');
 const net = require('net');
 const express = require('express');
 const { loadConfig, normalizeConfig } = require('./lib/config');
-const { matchTarget } = require('./lib/routing');
+const { CustomSubdomainStore, validatePortForTarget } = require('./lib/custom-subdomains');
+const { getDomainPrefix, matchTarget, normalizeHost } = require('./lib/routing');
 const { log, maskHeaders } = require('./lib/logger');
-const { parseCookies, buildWarningPage } = require('./lib/suspicion');
+const { parseCookies } = require('./lib/suspicion');
 const { proxyRequest } = require('./lib/proxy');
 
 const app = express();
@@ -16,14 +17,100 @@ let requestCounter = 0;
 
 const { config, source: configSource } = loadConfig();
 const normalizedConfig = normalizeConfig(config, configSource);
+const subdomainStore = new CustomSubdomainStore({
+    filePath: normalizedConfig.customSubdomainsDb,
+    configuredSubdomains: normalizedConfig.customSubdomains,
+    targets: normalizedConfig.targets
+});
+const targetsByName = new Map(normalizedConfig.targets.map((target) => [target.name, target]));
+
+function wantsJson(req) {
+    return req.accepts(['json', 'text']) === 'json';
+}
+
+function sendAdminError(res, status, message) {
+    return res.status(status).json({ error: message });
+}
+
+function requireAdmin(req, res, next) {
+    if (!normalizedConfig.masterToken) {
+        return sendAdminError(res, 503, 'Admin API disabled: masterToken is not configured.');
+    }
+
+    const authHeader = req.get('authorization') || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (token !== normalizedConfig.masterToken) {
+        return sendAdminError(res, 401, 'Unauthorized.');
+    }
+
+    return next();
+}
 
 function resolveTarget(hostHeader) {
-    const hostOnly = (hostHeader || '').split(':')[0].toLowerCase();
-    const domaincut = hostOnly.endsWith(normalizedConfig.domaincut)
-        ? hostOnly.slice(0, -normalizedConfig.domaincut.length)
-        : '';
-    return matchTarget(domaincut, normalizedConfig.targets);
+    const hostname = normalizeHost(hostHeader);
+    const domainPrefix = getDomainPrefix(hostname, normalizedConfig.domaincut);
+    if (domainPrefix === null) {
+        return { error: `Host must end with ${normalizedConfig.domaincut}.` };
+    }
+
+    const customMapping = subdomainStore.get(domainPrefix);
+    if (customMapping) {
+        const target = targetsByName.get(customMapping.target);
+        if (!target) return { error: 'Custom subdomain target not found.' };
+
+        return {
+            target,
+            port: customMapping.port,
+            subdomain: domainPrefix,
+            routeType: 'custom-subdomain'
+        };
+    }
+
+    const matched = matchTarget(domainPrefix, normalizedConfig.targets);
+    if (matched.error) return matched;
+    return { ...matched, routeType: 'encoded-port' };
 }
+
+const adminRouter = express.Router();
+
+adminRouter.use(express.json({ limit: '32kb' }));
+
+adminRouter.get('/subdomains', requireAdmin, (req, res) => {
+    return res.json({
+        domain: normalizedConfig.domaincut,
+        subdomains: subdomainStore.list()
+    });
+});
+
+adminRouter.post('/subdomains', requireAdmin, (req, res) => {
+    const body = req.body || {};
+    const subdomain = typeof body.subdomain === 'string'
+        ? body.subdomain.toLowerCase().trim()
+        : '';
+    const targetName = typeof body.target === 'string' ? body.target : '';
+    const port = Number(body.port);
+
+    const result = subdomainStore.set(subdomain, targetName, port);
+    if (result.error) return sendAdminError(res, 400, result.error);
+
+    log('info', 'Custom subdomain saved', {
+        subdomain: result.subdomain,
+        target: result.target,
+        port: result.port
+    });
+    return res.status(201).json(result);
+});
+
+adminRouter.delete('/subdomains/:subdomain', requireAdmin, (req, res) => {
+    const result = subdomainStore.remove(req.params.subdomain);
+    if (result.error) return sendAdminError(res, 400, result.error);
+    if (!result.deleted) return sendAdminError(res, 404, 'Subdomain not found.');
+
+    log('info', 'Custom subdomain deleted', { subdomain: req.params.subdomain });
+    return res.status(204).end();
+});
+
+app.use('/__proxy-admin', adminRouter);
 
 app.use(async (req, res) => {
     const reqId = ++requestCounter;
@@ -41,21 +128,26 @@ app.use(async (req, res) => {
     const match = resolveTarget(req.get('host'));
     if (match.error) {
         log('warn', 'Target error', { id: reqId, error: match.error, host: req.get('host') });
-        return res.status(404).send(match.error);
+        if (wantsJson(req)) return res.status(404).json({ error: match.error });
+        return res.status(404).type('text/plain').send(match.error);
     }
 
-    const { target, port } = match;
-
-    if (Number.isInteger(target.portStart) && port < target.portStart) {
-        log('warn', 'Port out of range (low)', { id: reqId, port, min: target.portStart, target: target.name });
-        return res.status(400).send('Port out of range');
-    }
-    if (Number.isInteger(target.portEnd) && port > target.portEnd) {
-        log('warn', 'Port out of range (high)', { id: reqId, port, max: target.portEnd, target: target.name });
-        return res.status(400).send('Port out of range');
+    const { target, port, routeType, subdomain } = match;
+    const portError = validatePortForTarget(target, port);
+    if (portError) {
+        log('warn', 'Port out of range', { id: reqId, port, target: target.name, error: portError });
+        if (wantsJson(req)) return res.status(400).json({ error: portError });
+        return res.status(400).type('text/plain').send(portError);
     }
 
-    log('info', 'Routing decision', { id: reqId, target: target.name, host: target.host, port });
+    log('info', 'Routing decision', {
+        id: reqId,
+        target: target.name,
+        host: target.host,
+        port,
+        routeType,
+        subdomain
+    });
 
     if (req.path === '/__proxy-notice' && req.method === 'GET') {
         const nextParam = req.query?.next;
@@ -98,20 +190,22 @@ server.on('upgrade', (req, socket, head) => {
         return;
     }
 
-    const { target, port } = match;
-
-    if (Number.isInteger(target.portStart) && port < target.portStart) {
-        socket.write('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
-        socket.destroy();
-        return;
-    }
-    if (Number.isInteger(target.portEnd) && port > target.portEnd) {
+    const { target, port, routeType, subdomain } = match;
+    const portError = validatePortForTarget(target, port);
+    if (portError) {
         socket.write('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
         socket.destroy();
         return;
     }
 
-    log('info', 'WebSocket upgrade', { url: req.url, target: target.name, host: target.host, port });
+    log('info', 'WebSocket upgrade', {
+        url: req.url,
+        target: target.name,
+        host: target.host,
+        port,
+        routeType,
+        subdomain
+    });
 
     const upstream = net.connect(port, target.host, () => {
         let reqHead = `${req.method} ${req.url} HTTP/1.1\r\n`;

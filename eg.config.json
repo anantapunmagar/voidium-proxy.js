@@ -1,9 +1,14 @@
 {
-  "domaincut": "localhost:",
+  "domaincut": ".voidium.uk",
+  "masterToken": "change-me",
+  "customSubdomainsDb": "./custom-subdomains.json",
   "pyro": {
     "letter": "p",
     "host": "127.0.0.1",
     "portStart": 3000,
     "portEnd": 3000
+  },
+  "customSubdomains": {
+    "demo": { "target": "pyro", "port": 3000 }
   }
 }
